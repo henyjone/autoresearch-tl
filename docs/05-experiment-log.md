@@ -127,20 +127,193 @@
 
 ---
 
+### Exp8: 降低学习率 + 长 warmdown — commit 70b8738 (discarded)
+
+**动机**：Exp4-6 显示训练/验证差距较大（~0.55 dB），尝试降低 LR 和延长 warmdown 让模型收敛更平稳
+**变更**：LR 3e-3→2e-3，warmdown_ratio 0.3→0.4，final_lr_frac 0.01→0.01
+
+**训练过程**：
+
+| Step | Progress | Loss | ~RMSE | LR | Epoch |
+|------|----------|------|-------|-----|-------|
+| 0 | 0% | 368.1 | 19.18 | 0.000 | 1 |
+| 5000 | 25% | 1.69 | 1.30 | 0.002 | 105 |
+| 10000 | 50% | 1.40 | 1.18 | 0.002 | 209 |
+| 15000 | 75% | 1.05 | 1.03 | 0.001 | 313 |
+| 20000 | 100% | 0.67 | 0.82 | 0.000 | 417 |
+
+**结果**：val_rmse=1.908 dB (+0.228) | **discard**
+**教训**：训练 RMSE 降至 0.82 但 val 1.91 → **严重过拟合**。低 LR + 长 warmdown 给了模型太多时间在低学习率下记忆训练集。train/val 差距 1.09 dB 是所有实验中最大的。
+
+---
+
+### Exp9: 强正则化 — commit 88dff25 (discarded)
+
+**动机**：针对 exp8 暴露的过拟合问题，加强 weight_decay 和缩短 warmdown
+**变更**：weight_decay 1e-4→5e-4，warmdown_ratio 0.3→0.2，final_lr_frac 0.01→0.05
+
+**训练过程**：
+
+| Step | Progress | Loss | ~RMSE | LR | Epoch |
+|------|----------|------|-------|-----|-------|
+| 0 | 0% | 368.1 | 19.18 | 0.000 | 1 |
+| 5000 | 25% | 1.69 | 1.30 | 0.003 | 105 |
+| 10000 | 50% | 1.40 | 1.18 | 0.003 | 209 |
+| 15000 | 75% | 1.05 | 1.03 | 0.002 | 313 |
+| 19500 | 99% | 0.95 | 0.98 | 0.000 | 407 |
+
+**结果**：val_rmse=1.787 dB (+0.107) | **discard**
+**教训**：更强的 weight_decay 限制了模型有效容量，train/val 差距仍然较大。weight_decay 不是解决过拟合的有效手段。
+
+---
+
+### Exp10: 高斯噪声增强 — (discarded)
+
+**动机**：通过向输入添加随机噪声实现数据增强
+**变更**：batch 4096→2048，训练时给输入加高斯噪声 std=0.05
+
+**结果**：val_rmse=2.163 dB (+0.483) | **discard**
+**教训**：噪声 std=0.05 对归一化后的输入来说太强了，严重干扰了模型学习。数据增强的强度需要非常谨慎。
+
+---
+
+### Exp11: Mixup 数据增强 — (discarded)
+
+**动机**：Mixup 是经过验证的正则化方法，通过插值样本创建虚拟训练数据
+**变更**：Beta(0.4, 0.4) mixup + fusion 层 6→4
+
+**结果**：val_rmse=2.260 dB (+0.580) | **discard**
+**教训**：**Mixup 不适合 TL 回归**。混合不同海洋环境的 TL 值产生物理上不存在的训练目标（比如混合深水和浅水场景的 TL 是无意义的）。Mixup 更适合分类或同质数据的回归。
+
+---
+
+### Exp12: 缩小模型 — (discarded)
+
+**动机**：8.7M 参数 vs 200K 训练样本 = 43:1 参数/样本比，过拟合是必然的。大幅减小模型。
+**变更**：branch_dim 256→128，fusion_dim 512→256，branch_layers 3→2，fusion_layers 6→4，batch 4096→2048
+
+**训练过程**：
+
+| Step | Progress | Loss | ~RMSE | LR | Epoch |
+|------|----------|------|-------|-----|-------|
+| 0 | 0% | 362.1 | 19.03 | 0.000 | 1 |
+| 5000 | 18% | 1.90 | 1.38 | 0.003 | 52 |
+| 15000 | 55% | 1.55 | 1.24 | 0.003 | 155 |
+| 25000 | 90% | 1.11 | 1.05 | 0.001 | 258 |
+| 27500 | 99% | 1.01 | 1.01 | 0.000 | 284 |
+
+**结果**：val_rmse=1.784 dB (+0.104) | 1,607K params | 236MB | **discard**
+**教训**：过拟合差距缩小（train 1.01 vs val 1.78 = 0.77 dB gap，vs exp6 的 0.55 dB），但模型容量不足。参数/样本比 8:1 更健康但欠拟合。最优点在中间。
+
+---
+
+### Exp13: Conv1D SSP/Bathymetry 编码器 — (discarded)
+
+**动机**：SSP(20维) 和 bathymetry(20维) 是有序序列，Conv1D 应该能捕获局部模式（如声道、地形坡度）
+**变更**：SSP 和 bathy 分支的 MLP 编码器替换为 3 层 Conv1D + BatchNorm + 全局池化
+
+**结果**：val_rmse=1.685 dB (+0.005) | 8,522K params | 1,256MB | **discard（极其接近但没改善）**
+**教训**：Conv1D 与 MLP 效果几乎相同。说明 prepare.py 的归一化已经把序列特征处理得很好，局部空间关系在 MLP 中也能学到。
+
+---
+
+### Exp14: 随机深度 — (discarded)
+
+**动机**：Stochastic Depth 是深度网络的经典正则化方法
+**变更**：fusion blocks 加入 drop_path（从第1层的0线性增加到最后一层的0.15）
+
+**结果**：val_rmse=1.901 dB (+0.221) | **discard**
+**教训**：drop_path 破坏了 fusion trunk 的信息流，对于只有 6 层的网络来说太激进了。Stochastic depth 更适合 50+ 层的深度网络。
+
+---
+
+### Exp15: 更多注意力 + MSE loss — (discarded)
+
+**动机**：把计算预算从 MLP fusion 转移到注意力机制，同时尝试 MSE loss（合成数据无异常值）
+**变更**：cross-branch blocks 3→5，fusion layers 6→3，Huber→MSE
+
+**结果**：val_rmse=1.705 dB (+0.025) | 6,595K params | 1,160MB | **discard**
+**教训**：更多注意力层没有带来改善。3 层 transformer block 已经足够捕获分支间交互。MSE 和 Huber 差异不大。
+
+---
+
+### Exp16: 物理残差学习 — (discarded)
+
+**动机**：让网络预测 TL 与球面扩展估算（20·log10(range_m)）的差值，降低学习难度
+**变更**：forward 中计算 baseline = 20·log10(range_km × 1000)，网络预测 correction，pred = baseline + correction
+
+**结果**：val_rmse=1.929 dB (+0.249) | **discard**
+**教训**：归一化后的 range 值无法直接映射到 dB 域。物理残差需要在未归一化的原始特征上计算，但我们的输入已经被 prepare.py 归一化了。这个方法在原始数据域可能有效，但在当前框架下不适用。
+
+---
+
+### Exp17: Transformer blocks + batch 2048 — (discarded)
+
+**动机**：exp4(batch 2048)=1.701 vs exp6(batch 4096)=1.680，尝试 transformer blocks + batch 2048 的组合
+**变更**：仅 batch 4096→2048，其余和 exp6 相同
+
+**结果**：val_rmse=1.706 dB (+0.026) | 8,694K params | 580MB | **discard**
+**教训**：batch 2048 给了更多步数（23K vs 11K）但没改善 val_rmse。batch 4096 的梯度更稳定，对当前模型更有利。
+
+---
+
+### Exp18: 多头预测集成 — (discarded)
+
+**动机**：3 个独立输出头分别预测 TL，训练时都贡献 loss，推理时取平均（隐式集成）
+**变更**：out_head 替换为 3 个独立的 Linear(512, 1)，loss = 平均(各头 Huber loss)
+
+**结果**：val_rmse=1.888 dB (+0.208) | **discard**
+**教训**：3 个线性头共享相同的 fusion trunk 输出，多样性不足，无法形成有效集成。真正的集成需要不同的模型结构或不同的训练初始化。
+
+---
+
 ## 进展汇总
 
-| # | Commit | val_rmse | Δ | Params | VRAM | Status |
-|---|--------|----------|---|--------|------|--------|
-| 0 | 1252596 | 2.085 dB | — | 214K | 31MB | keep (baseline) |
-| 1 | 624297f | 2.069 dB | -0.016 | 6,342K | 272MB | keep |
-| 2 | 6065139 | 2.044 dB | -0.025 | 33,665K | 1,340MB | keep |
-| 3 | c9556af | 2.034 dB | -0.010 | 7,113K | 334MB | keep |
-| 4 | 7996430 | **1.701 dB** | **-0.333** | 7,640K | 413MB | keep |
-| 5 | 474ffef | 1.783 dB | +0.082 | 7,643K | 413MB | discard |
-| 6 | 25e2fcb | **1.680 dB** | **-0.021** | 8,694K | 1,038MB | keep |
-| 7 | 7635c2f | 1.709 dB | +0.029 | 19,530K | 1,626MB | discard |
+| # | val_rmse | Δ vs best | Status | 关键变更 |
+|---|----------|-----------|--------|---------|
+| 0 | 2.085 dB | — | keep | baseline MLP 4×256 |
+| 1 | 2.069 dB | -0.016 | keep | 残差MLP 6×512 + Huber |
+| 2 | 2.044 dB | -0.025 | keep | 残差MLP 8×1024（暴力加宽） |
+| 3 | 2.034 dB | -0.010 | keep | 分支编码器(geo+ssp+bathy) |
+| **4** | **1.701 dB** | **-0.333** | **keep** | **跨分支注意力(2层×4头)** |
+| 5 | 1.783 dB | +0.082 | discard | 物理导出特征 + dropout 0.05 |
+| **6** | **1.680 dB** | **-0.021** | **keep** | **Transformer blocks(3层) + batch 4096 + grad clip** |
+| 7 | 1.709 dB | +0.029 | discard | 加宽模型(branch 384, fusion 768) |
+| 8 | 1.908 dB | +0.228 | discard | 低 LR 2e-3 + 长 warmdown 0.4 |
+| 9 | 1.787 dB | +0.107 | discard | 强 weight_decay 5e-4 |
+| 10 | 2.163 dB | +0.483 | discard | 高斯噪声 std=0.05 |
+| 11 | 2.260 dB | +0.580 | discard | Mixup beta=0.4 |
+| 12 | 1.784 dB | +0.104 | discard | 小模型(1.6M params) |
+| 13 | 1.685 dB | +0.005 | discard | Conv1D SSP/bathy 编码器 |
+| 14 | 1.901 dB | +0.221 | discard | 随机深度 drop_path 0→0.15 |
+| 15 | 1.705 dB | +0.025 | discard | 5 注意力块 + 3 fusion + MSE |
+| 16 | 1.929 dB | +0.249 | discard | 物理残差学习 |
+| 17 | 1.706 dB | +0.026 | discard | Transformer + batch 2048 |
+| 18 | 1.888 dB | +0.208 | discard | 多头预测集成(3头) |
 
 **当前最佳**：1.680 dB（实验 6）| 相对 baseline：-0.405 dB（19.4%↓）
+
+---
+
+## 经验教训总结
+
+### 有效的改进方向
+1. **跨分支注意力**（exp4, -16.4%）：让特征组之间互相"看到"对方，是最大的单次改进
+2. **分支编码器**（exp3）：按物理语义拆分输入比暴力加宽更高效
+3. **Transformer blocks**（exp6）：attention + FFN 比纯 attention 更好
+4. **梯度裁剪**（exp6）：稳定训练
+5. **Huber loss**（exp1）：比 MSE 稍好
+
+### 无效或有害的方向
+1. **暴力加大模型**（exp2, exp7）：参数量翻倍 RMSE 几乎不变，收益严重递减
+2. **各种正则化**（exp8-11, exp14）：weight_decay、dropout、噪声、mixup、stochastic depth 全部失败
+3. **特征工程**（exp5, exp16）：在归一化后的数据上添加物理特征反而过拟合
+4. **架构变体**（exp12, exp13, exp15, exp18）：Conv1D、多头、模型缩放都无显著改善
+
+### 关键认识
+- **200K 合成数据是当前瓶颈**：模型已经能很好地拟合训练集（~1.0 dB），但泛化到验证集只能到 ~1.68 dB
+- **Phase 2 更大规模/更真实的数据**是突破 1.5 dB 的关键路径
+- 当前架构（分支编码器 + 跨分支 transformer + fusion trunk）是一个良好的基础
 
 ---
 
