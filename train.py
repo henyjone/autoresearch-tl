@@ -23,33 +23,47 @@ from prepare import MAX_FEATURES, TIME_BUDGET, FeatureStats, make_dataloader, ev
 @dataclass
 class TLNetConfig:
     n_features: int = 64       # MAX_FEATURES from prepare.py
-    hidden_dim: int = 256
-    n_layers: int = 4
-    dropout: float = 0.1
+    hidden_dim: int = 512
+    n_layers: int = 6
+    dropout: float = 0.05
+
+
+class ResidualBlock(nn.Module):
+    """Pre-norm residual block: LayerNorm -> Linear -> GELU -> Dropout -> Linear -> Add"""
+    def __init__(self, dim, dropout=0.05):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, dim * 2)
+        self.fc2 = nn.Linear(dim * 2, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        h = self.norm(x)
+        h = F.gelu(self.fc1(h))
+        h = self.dropout(h)
+        h = self.fc2(h)
+        return x + h
 
 
 class TLNet(nn.Module):
-    """Baseline MLP for transmission loss prediction.
+    """Residual MLP for transmission loss prediction.
 
     Input:  normalized feature vector (B, MAX_FEATURES)
     Output: predicted TL in dB (B,)
 
-    Architecture: Linear -> GELU -> Dropout -> ... -> Linear(1)
+    Architecture: Linear projection -> N x ResidualBlock -> LayerNorm -> Linear(1)
     """
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        layers = []
-        in_dim = config.n_features
-        for i in range(config.n_layers):
-            layers.append(nn.Linear(in_dim, config.hidden_dim))
-            layers.append(nn.GELU())
-            if config.dropout > 0:
-                layers.append(nn.Dropout(config.dropout))
-            in_dim = config.hidden_dim
-        layers.append(nn.Linear(config.hidden_dim, 1))
-        self.net = nn.Sequential(*layers)
+        self.input_proj = nn.Linear(config.n_features, config.hidden_dim)
+        self.blocks = nn.ModuleList([
+            ResidualBlock(config.hidden_dim, config.dropout)
+            for _ in range(config.n_layers)
+        ])
+        self.out_norm = nn.LayerNorm(config.hidden_dim)
+        self.out_head = nn.Linear(config.hidden_dim, 1)
 
     def forward(self, x, targets=None):
         """
@@ -58,12 +72,16 @@ class TLNet(nn.Module):
             targets: (B,) TL values in dB, or None
 
         Returns:
-            If targets is not None: scalar MSE loss
+            If targets is not None: scalar Huber loss
             If targets is None: predictions (B,)
         """
-        pred = self.net(x).squeeze(-1)  # (B,)
+        h = F.gelu(self.input_proj(x))
+        for block in self.blocks:
+            h = block(h)
+        h = self.out_norm(h)
+        pred = self.out_head(h).squeeze(-1)  # (B,)
         if targets is not None:
-            return F.mse_loss(pred, targets)
+            return F.huber_loss(pred, targets, delta=5.0)
         return pred
 
 # ---------------------------------------------------------------------------
@@ -71,13 +89,13 @@ class TLNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-HIDDEN_DIM = 256          # hidden layer width
-N_LAYERS = 4              # number of hidden layers
-DROPOUT = 0.1             # dropout rate
+HIDDEN_DIM = 512          # hidden layer width
+N_LAYERS = 6              # number of residual blocks
+DROPOUT = 0.05            # dropout rate
 
 # Optimization
-BATCH_SIZE = 1024         # training batch size
-LEARNING_RATE = 1e-3      # peak learning rate
+BATCH_SIZE = 2048         # training batch size
+LEARNING_RATE = 3e-3      # peak learning rate
 WEIGHT_DECAY = 1e-4       # AdamW weight decay
 ADAM_BETAS = (0.9, 0.999) # Adam beta parameters
 WARMUP_RATIO = 0.05       # fraction of time for LR warmup
