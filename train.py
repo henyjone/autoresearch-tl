@@ -125,7 +125,7 @@ class TLNet(nn.Module):
 
         # Cross-branch transformer blocks (3 layers)
         self.cross_attn = nn.ModuleList([
-            CrossBranchBlock(config.branch_dim, n_heads=4, dropout=config.dropout)
+            CrossBranchBlock(config.branch_dim, n_heads=8, dropout=config.dropout)
             for _ in range(3)
         ])
 
