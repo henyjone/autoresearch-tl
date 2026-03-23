@@ -642,17 +642,340 @@ def evaluate_rmse(model, stats, batch_size):
 # Main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 2: pyram (parabolic equation) data generation
+# ---------------------------------------------------------------------------
+
+def run_pyram_scenario(freq, zs, ssp_depths, ssp_values, water_depth,
+                       bathy_ranges_km, bathy_depths,
+                       bottom_ss, bottom_density, max_range_km):
+    """Run pyram for a single scenario, return (vr_km, vz, tlg) or None on failure.
+
+    Args:
+        freq: Frequency in Hz
+        zs: Source depth in m
+        ssp_depths: SSP depth array (m)
+        ssp_values: Sound speed values (m/s) at ssp_depths
+        water_depth: Water depth at source (m)
+        bathy_ranges_km: Bathymetry range points (km), length 20
+        bathy_depths: Bathymetry depth values (m), length 20
+        bottom_ss: Bottom sound speed (m/s)
+        bottom_density: Bottom density (g/cm3)
+        max_range_km: Maximum range (km)
+
+    Returns:
+        (vr_km, vz, tlg) or None if pyram fails
+    """
+    from pyram.PyRAM import PyRAM
+
+    max_range_m = max_range_km * 1000.0
+
+    # Build SSP that covers full water column
+    # pyram requires SSP to extend to at least the deepest bathymetry point
+    max_bathy = float(np.max(bathy_depths))
+    required_depth = max(water_depth, max_bathy) + 1.0
+
+    z_ss = ssp_depths.copy()
+    cw_1d = ssp_values.copy()
+
+    # Ensure z_ss starts at 0
+    if z_ss[0] > 0:
+        z_ss = np.concatenate([[0.0], z_ss])
+        cw_1d = np.concatenate([cw_1d[:1], cw_1d])
+
+    # Extend SSP to cover full depth if needed
+    if z_ss[-1] < required_depth:
+        z_ss = np.append(z_ss, required_depth)
+        cw_1d = np.append(cw_1d, cw_1d[-1])  # extrapolate with last value
+
+    if len(z_ss) < 2:
+        z_ss = np.array([0.0, required_depth])
+        cw_1d = np.array([1500.0, 1500.0])
+
+    # Range-independent SSP (single column)
+    rp_ss = np.array([0.0])
+    cw = cw_1d.reshape(-1, 1)
+
+    # Seabed parameters (range-independent, single point)
+    z_sb = np.array([0.0])
+    rp_sb = np.array([0.0])
+    cb = np.array([[float(bottom_ss)]])
+    rhob = np.array([[float(bottom_density)]])
+    attn = np.array([[0.5]])  # dB/wavelength
+
+    # Bathymetry: convert to [range_m, depth_m] format
+    bathy_r_m = bathy_ranges_km * 1000.0
+    rbzb = np.column_stack([bathy_r_m, bathy_depths])
+    # Ensure starts at 0 and ends at max_range
+    if rbzb[0, 0] > 0:
+        rbzb = np.vstack([[0.0, rbzb[0, 1]], rbzb])
+    if rbzb[-1, 0] < max_range_m:
+        rbzb = np.vstack([rbzb, [max_range_m, rbzb[-1, 1]]])
+
+    try:
+        zr = min(zs, water_depth - 1.0)  # dummy receiver depth (we use full grid)
+        zr = max(1.0, zr)
+        model = PyRAM(freq, zs, zr, z_ss, rp_ss, cw,
+                      z_sb, rp_sb, cb, rhob, attn, rbzb,
+                      rmax=max_range_m)
+        model.run()
+
+        # Filter out invalid TL values
+        tlg = model.tlg
+        if np.any(np.isnan(tlg)) or np.any(np.isinf(tlg)):
+            tlg = np.nan_to_num(tlg, nan=200.0, posinf=200.0, neginf=10.0)
+
+        return model.vr / 1000.0, model.vz, tlg  # vr in km
+    except Exception:
+        return None
+
+
+def _generate_pyram_worker(args):
+    """Worker function for parallel pyram data generation."""
+    scenario_idx, seed, samples_per_run = args
+    rng = np.random.default_rng(seed)
+
+    # Sample random environment — constrained to keep pyram runtime < ~2s
+    # Grid size ∝ freq * depth * range, so limit the product
+    freq = 10 ** rng.uniform(1.3, 3.3)  # 20 Hz - 2 kHz (safe range)
+
+    regime = rng.choice(["shallow", "medium", "deep"], p=[0.35, 0.40, 0.25])
+    if regime == "shallow":
+        water_depth = rng.uniform(30, 200)
+    elif regime == "medium":
+        water_depth = rng.uniform(200, 1000)
+    else:
+        water_depth = rng.uniform(1000, 3000)
+
+    src_depth = rng.uniform(5, min(300, water_depth - 5))
+
+    # Limit range to keep pyram grid manageable: freq*depth*range < budget
+    # Budget ~5e8 keeps most runs under 2s
+    grid_budget = 5e8
+    max_possible_range_km = min(200, grid_budget / (freq * water_depth) / 1000)
+    max_possible_range_km = max(2, min(max_possible_range_km, 100))
+    max_range_km = rng.uniform(2, max_possible_range_km)
+
+    # Bottom type
+    bottom_types = list(BOTTOM_TYPES.keys())
+    bt = rng.choice(bottom_types)
+    bottom_ss = BOTTOM_TYPES[bt]["soundspeed"] + rng.normal(0, 20)
+    bottom_density = BOTTOM_TYPES[bt]["density"] + rng.normal(0, 0.1)
+    bottom_density = max(1.0, bottom_density)
+
+    # SSP
+    ssp_type = rng.choice(["isovelocity", "thermocline", "deep_channel", "arctic", "shallow"],
+                          p=[0.15, 0.30, 0.25, 0.15, 0.15])
+    ssp_values = generate_ssp_profile(ssp_type, water_depth, rng)
+
+    # Bathymetry
+    bathy_type = rng.choice(["flat", "slope", "shelf_break", "seamount", "rough"],
+                            p=[0.25, 0.25, 0.20, 0.15, 0.15])
+    if bathy_type == "flat":
+        water_depth_rcv = water_depth + rng.normal(0, water_depth * 0.05)
+    elif bathy_type == "slope":
+        water_depth_rcv = water_depth * rng.uniform(0.3, 3.0)
+    elif bathy_type == "shelf_break":
+        water_depth_rcv = rng.uniform(1500, 4500) if water_depth < 500 else rng.uniform(50, 300)
+    elif bathy_type == "seamount":
+        water_depth_rcv = water_depth + rng.normal(0, water_depth * 0.1)
+    else:
+        water_depth_rcv = water_depth + rng.normal(0, water_depth * 0.15)
+    water_depth_rcv = max(20, min(water_depth_rcv, 6000))
+
+    bathy_profile = generate_bathymetry_profile(
+        bathy_type, water_depth, water_depth_rcv, 20, rng)
+
+    # Bathymetry range points (20 evenly spaced)
+    bathy_ranges_km = np.linspace(0, max_range_km, 20)
+
+    # Run pyram
+    result = run_pyram_scenario(
+        freq, src_depth, SSP_DEPTHS, ssp_values, water_depth,
+        bathy_ranges_km, bathy_profile,
+        bottom_ss, bottom_density, max_range_km)
+
+    if result is None:
+        return None
+
+    vr_km, vz, tlg = result
+
+    # Sample random (receiver_depth, range) points from the grid
+    n_depths, n_ranges = tlg.shape
+    if n_depths < 2 or n_ranges < 2:
+        return None
+
+    features_list = []
+    targets_list = []
+
+    for _ in range(samples_per_run):
+        # Random range index (skip very close range)
+        ri = rng.integers(max(1, n_ranges // 20), n_ranges)
+        # Random depth index (within water column at this range)
+        # Estimate water depth at this range from bathymetry
+        range_frac = vr_km[ri] / max_range_km if max_range_km > 0 else 0
+        local_depth = np.interp(range_frac, np.linspace(0, 1, 20), bathy_profile)
+        max_di = np.searchsorted(vz, local_depth) - 1
+        max_di = max(1, min(max_di, n_depths - 1))
+        di = rng.integers(0, max_di + 1)
+
+        rcv_depth = vz[di]
+        range_km = vr_km[ri]
+        tl = tlg[di, ri]
+
+        # Bounds check
+        if tl < 10 or tl > 200 or np.isnan(tl):
+            continue
+
+        # Local water depth at receiver
+        wd_rcv = np.interp(range_frac, np.linspace(0, 1, 20), bathy_profile)
+
+        # Pack feature vector
+        feat = np.zeros(MAX_FEATURES, dtype=np.float64)
+        feat[IDX_FREQ] = freq
+        feat[IDX_SRC_DEPTH] = src_depth
+        feat[IDX_RCV_DEPTH] = rcv_depth
+        feat[IDX_RANGE] = range_km
+        feat[IDX_WATER_DEPTH_SRC] = water_depth
+        feat[IDX_WATER_DEPTH_RCV] = wd_rcv
+        feat[IDX_BOTTOM_SS] = bottom_ss
+        feat[IDX_BOTTOM_DENSITY] = bottom_density
+        feat[IDX_SSP_START:IDX_SSP_END] = ssp_values
+        feat[IDX_BATHY_START:IDX_BATHY_END] = bathy_profile
+
+        features_list.append(feat)
+        targets_list.append(tl)
+
+    if len(features_list) == 0:
+        return None
+
+    return np.array(features_list), np.array(targets_list)
+
+
+def generate_phase2_data(n_runs=4000, samples_per_run=250,
+                         val_runs=500, val_samples_per_run=100,
+                         n_workers=4):
+    """Generate Phase 2 data using pyram parabolic equation model.
+
+    Args:
+        n_runs: Number of pyram scenarios for training
+        samples_per_run: Samples extracted per scenario (training)
+        val_runs: Number of pyram scenarios for validation
+        val_samples_per_run: Samples extracted per scenario (validation)
+        n_workers: Number of parallel workers
+    """
+    from multiprocessing import Pool
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    train_path = os.path.join(DATA_DIR, "train.npz")
+    val_path = os.path.join(DATA_DIR, "val.npz")
+    stats_path = os.path.join(DATA_DIR, "stats.npz")
+
+    # Training data
+    print(f"Phase 2: Generating training data ({n_runs} pyram runs × {samples_per_run} samples)...")
+    t0 = time.time()
+
+    train_args = [(i, 1000000 + i, samples_per_run) for i in range(n_runs)]
+
+    all_features = []
+    all_targets = []
+
+    if n_workers > 1:
+        with Pool(n_workers) as pool:
+            for i, result in enumerate(pool.imap_unordered(_generate_pyram_worker, train_args)):
+                if result is not None:
+                    all_features.append(result[0])
+                    all_targets.append(result[1])
+                if (i + 1) % 100 == 0:
+                    n_samples = sum(f.shape[0] for f in all_features)
+                    elapsed = time.time() - t0
+                    print(f"  [{i+1}/{n_runs}] {n_samples:,} samples, {elapsed:.0f}s elapsed")
+    else:
+        for i, args in enumerate(train_args):
+            result = _generate_pyram_worker(args)
+            if result is not None:
+                all_features.append(result[0])
+                all_targets.append(result[1])
+            if (i + 1) % 100 == 0:
+                n_samples = sum(f.shape[0] for f in all_features)
+                elapsed = time.time() - t0
+                print(f"  [{i+1}/{n_runs}] {n_samples:,} samples, {elapsed:.0f}s elapsed")
+
+    train_features = np.concatenate(all_features).astype(np.float32)
+    train_targets = np.concatenate(all_targets).astype(np.float32)
+    t1 = time.time()
+    print(f"  Training: {train_features.shape[0]:,} samples in {t1-t0:.0f}s")
+
+    # Validation data (different seeds)
+    print(f"Phase 2: Generating validation data ({val_runs} pyram runs)...")
+    val_args = [(i, 9000000 + i, val_samples_per_run) for i in range(val_runs)]
+
+    val_features_list = []
+    val_targets_list = []
+
+    if n_workers > 1:
+        with Pool(n_workers) as pool:
+            for result in pool.imap_unordered(_generate_pyram_worker, val_args):
+                if result is not None:
+                    val_features_list.append(result[0])
+                    val_targets_list.append(result[1])
+    else:
+        for args in val_args:
+            result = _generate_pyram_worker(args)
+            if result is not None:
+                val_features_list.append(result[0])
+                val_targets_list.append(result[1])
+
+    val_features = np.concatenate(val_features_list).astype(np.float32)
+    val_targets = np.concatenate(val_targets_list).astype(np.float32)
+    t2 = time.time()
+    print(f"  Validation: {val_features.shape[0]:,} samples in {t2-t1:.0f}s")
+
+    # Compute normalization statistics from training data
+    mean = train_features.mean(axis=0)
+    std = train_features.std(axis=0)
+    std[std < 1e-8] = 1.0
+    target_mean = float(train_targets.mean())
+    target_std = float(train_targets.std())
+
+    # Save (overwrites Phase 1 data)
+    np.savez_compressed(train_path, features=train_features, targets=train_targets)
+    np.savez_compressed(val_path, features=val_features, targets=val_targets)
+    np.savez_compressed(stats_path, mean=mean.astype(np.float32), std=std.astype(np.float32),
+                        target_mean=np.float32(target_mean), target_std=np.float32(target_std))
+
+    print(f"\nPhase 2 data saved to {DATA_DIR}")
+    print(f"  Training:   {train_features.shape[0]:,} samples")
+    print(f"  Validation: {val_features.shape[0]:,} samples")
+    print(f"  TL range:   [{train_targets.min():.1f}, {train_targets.max():.1f}] dB")
+    print(f"  TL mean:    {target_mean:.1f} dB")
+    print(f"  TL std:     {target_std:.1f} dB")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare data for autoresearch-tl")
+    parser.add_argument("--phase", type=int, default=1, choices=[1, 2],
+                        help="Data generation phase (1=analytical, 2=pyram)")
     parser.add_argument("--num-train", type=int, default=200_000,
-                        help="Number of training samples (default: 200000)")
+                        help="Number of training samples for Phase 1 (default: 200000)")
     parser.add_argument("--num-val", type=int, default=50_000,
-                        help="Number of validation samples (default: 50000)")
+                        help="Number of validation samples for Phase 1 (default: 50000)")
+    parser.add_argument("--runs", type=int, default=4000,
+                        help="Number of pyram runs for Phase 2 training (default: 4000)")
+    parser.add_argument("--samples-per-run", type=int, default=250,
+                        help="Samples per pyram run for Phase 2 (default: 250)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel workers for Phase 2 (default: 4)")
     args = parser.parse_args()
 
     print(f"Cache directory: {CACHE_DIR}")
     print()
 
-    generate_phase1_data(n_train=args.num_train, n_val=args.num_val)
+    if args.phase == 1:
+        generate_phase1_data(n_train=args.num_train, n_val=args.num_val)
+    else:
+        generate_phase2_data(n_runs=args.runs, samples_per_run=args.samples_per_run,
+                             n_workers=args.workers)
     print()
     print("Done! Ready to train.")

@@ -9,6 +9,7 @@ dependencies = [
     "torch>=2.5",
     "matplotlib>=3.9",
     "pandas>=2.2",
+    "pyram>=1.3.0",
 ]
 
 [tool.uv.sources]
