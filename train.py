@@ -118,9 +118,9 @@ class TLNet(nn.Module):
         super().__init__()
         self.config = config
 
-        # Branch encoders
+        # Branch encoders (geo gets +2 augmented features: freq*range, |depth_diff|)
         self.geo_encoder = make_branch_encoder(
-            config.geo_dim, config.branch_dim, config.n_branch_layers, config.dropout)
+            config.geo_dim + 2, config.branch_dim, config.n_branch_layers, config.dropout)
         self.ssp_encoder = make_branch_encoder(
             config.ssp_dim, config.branch_dim, config.n_branch_layers, config.dropout)
         self.bathy_encoder = make_branch_encoder(
@@ -150,8 +150,16 @@ class TLNet(nn.Module):
         ssp = x[:, 8:28]
         bathy = x[:, 28:48]
 
+        # Augment geo with physics-derived features:
+        # x[:,0]=freq(log10), x[:,3]=range(normalized), x[:,1]=src_depth, x[:,2]=rcv_depth
+        freq_feat = x[:, 0:1]           # already log10 scaled
+        range_feat = x[:, 3:4]          # normalized range
+        depth_diff = (x[:, 1:2] - x[:, 2:3]).abs()  # |src_depth - rcv_depth|
+        fr_interact = freq_feat * range_feat  # frequency-range interaction
+        geo_aug = torch.cat([geo, fr_interact, depth_diff], dim=1)  # 8+2=10
+
         # Encode each branch
-        geo_h = self.geo_encoder(geo)    # (B, branch_dim)
+        geo_h = self.geo_encoder(geo_aug)    # (B, branch_dim)
         ssp_h = self.ssp_encoder(ssp)
         bathy_h = self.bathy_encoder(bathy)
 
@@ -188,7 +196,7 @@ DROPOUT = 0.02            # dropout rate
 # Optimization
 BATCH_SIZE = 4096         # training batch size
 LEARNING_RATE = 3e-3      # peak learning rate
-WEIGHT_DECAY = 1e-4       # AdamW weight decay
+WEIGHT_DECAY = 5e-5       # AdamW weight decay
 ADAM_BETAS = (0.9, 0.999) # Adam beta parameters
 WARMUP_RATIO = 0.05       # fraction of time for LR warmup
 WARMDOWN_RATIO = 0.3      # fraction of time for LR cooldown

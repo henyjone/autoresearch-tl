@@ -735,26 +735,48 @@ def _generate_pyram_worker(args):
     scenario_idx, seed, samples_per_run = args
     rng = np.random.default_rng(seed)
 
-    # Sample random environment — constrained to keep pyram runtime < ~2s
+    # Sample random environment — constrained to keep pyram runtime manageable
     # Grid size ∝ freq * depth * range, so limit the product
-    freq = 10 ** rng.uniform(1.3, 3.3)  # 20 Hz - 2 kHz (safe range)
+    #
+    # Regime mix includes dedicated long-range deep-water scenarios
+    # to capture convergence zones (CZ ≈ every 50-65 km in deep ocean)
+    regime = rng.choice(["shallow", "medium", "deep", "deep_longrange"],
+                        p=[0.30, 0.35, 0.20, 0.15])
 
-    regime = rng.choice(["shallow", "medium", "deep"], p=[0.35, 0.40, 0.25])
-    if regime == "shallow":
+    if regime == "deep_longrange":
+        # Deep-water long-range: very low freq + deep ocean → convergence zones
+        # CZ occurs at ~55km intervals; need range > 100km for multiple CZ
+        # freq * depth * range(m) must fit grid_budget, so keep freq*depth small
+        freq = 10 ** rng.uniform(1.3, 1.7)  # 20 Hz - 50 Hz (CZ-viable, low grid cost)
+        water_depth = rng.uniform(1000, 3000)  # deep ocean
+    elif regime == "shallow":
+        freq = 10 ** rng.uniform(1.3, 3.3)  # 20 Hz - 2 kHz
         water_depth = rng.uniform(30, 200)
     elif regime == "medium":
+        freq = 10 ** rng.uniform(1.3, 3.3)
         water_depth = rng.uniform(200, 1000)
-    else:
+    else:  # deep
+        freq = 10 ** rng.uniform(1.3, 3.0)  # 20 Hz - 1 kHz
         water_depth = rng.uniform(1000, 3000)
 
     src_depth = rng.uniform(5, min(300, water_depth - 5))
 
     # Limit range to keep pyram grid manageable: freq*depth*range < budget
-    # Budget ~5e8 keeps most runs under 2s
-    grid_budget = 5e8
-    max_possible_range_km = min(200, grid_budget / (freq * water_depth) / 1000)
-    max_possible_range_km = max(2, min(max_possible_range_km, 100))
-    max_range_km = rng.uniform(2, max_possible_range_km)
+    # Use larger budget for deep_longrange to allow 200+ km
+    if regime == "deep_longrange":
+        grid_budget = 5e10  # very large grids for CZ scenarios (may take 10-60s per run)
+        max_range_cap = 300  # up to 300 km (covers 4-5 convergence zones)
+    else:
+        grid_budget = 5e8   # standard budget (~2s per run)
+        max_range_cap = 150  # increased from 100 km
+    max_possible_range_km = min(max_range_cap, grid_budget / (freq * water_depth) / 1000)
+    max_possible_range_km = max(2, max_possible_range_km)
+    if regime == "deep_longrange":
+        # Force long range: at least 50 km, ideally 100+ km for CZ
+        min_range_km = min(50, max_possible_range_km * 0.5)
+        max_range_km = rng.uniform(min_range_km, max_possible_range_km)
+    else:
+        max_range_km = rng.uniform(2, max_possible_range_km)
 
     # Bottom type
     bottom_types = list(BOTTOM_TYPES.keys())
@@ -763,9 +785,13 @@ def _generate_pyram_worker(args):
     bottom_density = BOTTOM_TYPES[bt]["density"] + rng.normal(0, 0.1)
     bottom_density = max(1.0, bottom_density)
 
-    # SSP
-    ssp_type = rng.choice(["isovelocity", "thermocline", "deep_channel", "arctic", "shallow"],
-                          p=[0.15, 0.30, 0.25, 0.15, 0.15])
+    # SSP — deep_longrange scenarios bias toward deep_channel (needed for CZ)
+    if regime == "deep_longrange":
+        ssp_type = rng.choice(["deep_channel", "thermocline", "arctic"],
+                              p=[0.60, 0.25, 0.15])
+    else:
+        ssp_type = rng.choice(["isovelocity", "thermocline", "deep_channel", "arctic", "shallow"],
+                              p=[0.15, 0.30, 0.25, 0.15, 0.15])
     ssp_values = generate_ssp_profile(ssp_type, water_depth, rng)
 
     # Bathymetry
