@@ -64,16 +64,37 @@ def make_branch_encoder(in_dim, hidden_dim, n_layers, dropout):
     return nn.Sequential(*layers)
 
 
+class CrossBranchAttention(nn.Module):
+    """Lightweight cross-attention: each branch attends to all branches."""
+    def __init__(self, dim, n_heads=4, dropout=0.02):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.norm = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, branches):
+        """branches: (B, 3, dim) — 3 branch embeddings stacked as a sequence."""
+        B, S, D = branches.shape
+        h = self.norm(branches)
+        qkv = self.qkv(h).reshape(B, S, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        out = (attn @ v).transpose(1, 2).reshape(B, S, D)
+        return branches + self.proj(out)
+
+
 class TLNet(nn.Module):
-    """Branch-encoder + fusion trunk for TL prediction.
+    """Branch-encoder + cross-attention + fusion trunk for TL prediction.
 
-    Splits the 64-dim input into 3 semantic groups:
-    - Geometry (8 dims): freq, depths, range, bottom params
-    - SSP (20 dims): sound speed profile at 20 standard depths
-    - Bathymetry (20 dims): water depth along propagation path
-
-    Each branch is encoded separately, then concatenated and
-    processed through a residual fusion trunk.
+    1. Split input into 3 semantic groups (geometry, SSP, bathymetry)
+    2. Encode each branch independently
+    3. Cross-attention between branches (learn interactions)
+    4. Concatenate + fusion trunk
     """
 
     def __init__(self, config):
@@ -87,6 +108,12 @@ class TLNet(nn.Module):
             config.ssp_dim, config.branch_dim, config.n_branch_layers, config.dropout)
         self.bathy_encoder = make_branch_encoder(
             config.bathy_dim, config.branch_dim, config.n_branch_layers, config.dropout)
+
+        # Cross-branch attention (2 layers)
+        self.cross_attn = nn.ModuleList([
+            CrossBranchAttention(config.branch_dim, n_heads=4, dropout=config.dropout)
+            for _ in range(2)
+        ])
 
         # Fusion: project concatenated branch outputs to fusion dim
         total_branch = config.branch_dim * 3
@@ -102,17 +129,22 @@ class TLNet(nn.Module):
 
     def forward(self, x, targets=None):
         # Split input into branches
-        geo = x[:, :8]      # freq, src_depth, rcv_depth, range, water_depths, bottom params
-        ssp = x[:, 8:28]    # SSP at 20 depths
-        bathy = x[:, 28:48] # bathymetry profile
+        geo = x[:, :8]
+        ssp = x[:, 8:28]
+        bathy = x[:, 28:48]
 
         # Encode each branch
-        geo_h = self.geo_encoder(geo)
+        geo_h = self.geo_encoder(geo)    # (B, branch_dim)
         ssp_h = self.ssp_encoder(ssp)
         bathy_h = self.bathy_encoder(bathy)
 
-        # Fuse
-        h = torch.cat([geo_h, ssp_h, bathy_h], dim=-1)
+        # Stack as sequence for cross-attention: (B, 3, branch_dim)
+        branches = torch.stack([geo_h, ssp_h, bathy_h], dim=1)
+        for attn_layer in self.cross_attn:
+            branches = attn_layer(branches)
+
+        # Flatten back and fuse
+        h = branches.reshape(branches.size(0), -1)  # (B, 3*branch_dim)
         h = F.gelu(self.fusion_proj(h))
 
         # Fusion trunk
