@@ -1,0 +1,13 @@
+data/
+results.tsv
+run.log
+progress.log
+training_curve.png
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.DS_Store
