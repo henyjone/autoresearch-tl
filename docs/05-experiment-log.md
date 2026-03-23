@@ -430,6 +430,287 @@
 
 ---
 
+## Phase 2 实验详细记录
+
+### Phase 2 概述
+
+**目标**：用 PyRAM 物理模型（抛物方程法）生成更真实的训练数据，突破 Phase 1 合成数据的 1.68 dB 瓶颈。
+
+**数据生成**：
+- PyRAM 计算全深度×距离 TL 网格，每次 run 从网格中采样多个点
+- 参数约束：freq 20-2000 Hz，grid_budget < 5e8（保证单次 run < 2s）
+- SSP 深度扩展到覆盖最大水深 + 1m（修复 pyram 深度校验错误）
+
+**数据规模演进**：
+| 阶段 | 训练样本 | 验证样本 | pyram runs | TL 范围 |
+|------|---------|---------|-----------|---------|
+| 初始 | 1,086,507 | 44,088 | 2,500 | 29.9~200.0 dB |
+| 扩展1 | 2,176,377 | 44,088 | 5,000 | 29.9~200.0 dB |
+| 扩展2 | ~4,400,000 | 44,088 | 10,000 | 29.9~200.0 dB |
+
+---
+
+### P2-Base: Phase 2 基线 — 1M pyram 数据
+
+**配置**：Phase 1 exp6 架构（branch 256, fusion 512, 4 heads, 3 cross-branch, 6 fusion）直接在 1M pyram 数据上训练
+**结果**：val_rmse=**10.314 dB** | 8,694K params | **keep (Phase 2 baseline)**
+**分析**：pyram 数据远比解析合成数据复杂（Phase 1 在合成数据上 1.68 dB）。10.3 dB 距离工程精度（<5 dB）还有较大差距。
+
+---
+
+### P2-Exp1: 加宽模型 (384/768) — 1M 数据
+
+**变更**：branch_dim 256→384, fusion_dim 512→768, 19.5M params
+**结果**：val_rmse=**9.793 dB (-0.521)** | **keep**
+**分析**：更大模型 + pyram 数据有效，改善 5%。说明 pyram 数据的复杂度能支撑更大模型。
+
+---
+
+### P2-Exp2: LR 5e-3 — (discarded)
+
+**变更**：LR 3e-3→5e-3
+**结果**：val_rmse=10.220 dB (+0.427) | **discard**
+**教训**：LR 5e-3 对宽模型太激进，优化不稳定。
+
+---
+
+### P2-Exp3: 更深模型 — (discarded)
+
+**变更**：branch_dim 256, fusion_dim 512, branch_layers 5, fusion_layers 10
+**结果**：val_rmse=10.984 dB (+1.191) | **discard**
+**教训**：深而窄远不如宽而浅。层数增加导致梯度传播困难，且步数更少。
+
+---
+
+### P2-Exp4: Batch 2048 — (discarded)
+
+**变更**：batch 4096→2048
+**结果**：val_rmse=10.139 dB (+0.346) | **discard**
+**教训**：更小 batch 给更多步数但梯度更嘈杂，在大数据集上不如 batch 4096。
+
+---
+
+### P2-Exp5: 5 层 Cross-Branch — (discarded)
+
+**变更**：cross-branch layers 3→5（22M params，仅 9.8K steps）
+**结果**：val_rmse=10.043 dB (+0.250) | **discard**
+**教训**：更多参数 = 每步更慢 = 5 分钟内步数不够。参数量和训练步数的权衡是 Phase 2 核心张力。
+
+---
+
+### P2-Exp6: Huber delta=10 — (discarded)
+
+**变更**：Huber delta 5.0→10.0
+**结果**：val_rmse=10.066 dB (+0.273) | **discard**
+**教训**：delta=10 接近纯 MSE，失去 Huber 对大误差的鲁棒性。
+
+---
+
+### P2-Exp7: MSE Loss — (discarded)
+
+**变更**：Huber loss → MSE loss
+**结果**：val_rmse=9.910 dB (+0.117) | **discard**
+**教训**：MSE 对 pyram 数据中的大 TL 值（200 dB 截断点附近）过于敏感。Huber delta=5.0 是好选择。
+
+---
+
+### P2-Exp8: 8 注意力头 — **新最佳**
+
+**变更**：cross-branch attention heads 4→8
+**结果**：val_rmse=**9.383 dB (-0.410, -4.4%)** | 19,530K params | 12,600 steps | **keep**
+**分析**：更多注意力头 = 更精细的分支间交互模式。head_dim 从 96→48，但更多独立注意力模式弥补了维度的减小。pyram 数据中环境-几何交互比合成数据更复杂，需要更细粒度的注意力。
+
+---
+
+### P2-Exp9: LR 4e-3 — (discarded)
+
+**变更**：LR 3e-3→4e-3（8 heads 模型上）
+**结果**：val_rmse=9.560 dB (+0.177) | **discard**
+**教训**：LR 4e-3 仍然偏高。3e-3 是当前架构的甜蜜点。
+
+---
+
+### P2-Exp10: 训练 10 分钟 — (discarded)
+
+**变更**：TIME_BUDGET 300s→600s（25K steps vs 12.6K）
+**结果**：val_rmse=10.217 dB (+0.834) | **discard**
+**教训**：**1M 数据上训练太久会过拟合**。更多步数让模型更深地记忆训练集。这与 Phase 1 exp8 的教训一致。
+
+---
+
+### P2-Exp11: Batch 8192 — (discarded)
+
+**变更**：batch 4096→8192
+**结果**：val_rmse=9.690 dB (+0.307) | 6,613 steps | 3,006MB VRAM | **discard**
+**教训**：步数减半（12.6K→6.6K），训练不充分。大 batch 需要更长训练时间才有优势。
+
+---
+
+### P2-Exp12: LR 2e-3 — (discarded)
+
+**变更**：LR 3e-3→2e-3
+**结果**：val_rmse=10.069 dB (+0.686) | 12,575 steps | **discard**
+**教训**：LR 太低，模型收敛太慢。在 5 分钟预算下无法到达好的损失区域。
+
+---
+
+### P2-Exp13: 中等模型 (256/512) — (discarded)
+
+**变更**：branch_dim 384→256, fusion_dim 768→512（8.7M params, 17.8K steps）
+**结果**：val_rmse=10.115 dB (+0.732) | **discard**
+**教训**：尽管步数更多，中等模型的容量不足以捕获 pyram 数据的复杂度。384/768 模型的表达能力优势大于步数劣势。
+
+---
+
+### P2-Exp14: 4 层 Cross-Branch — (discarded)
+
+**变更**：cross-branch layers 3→4（20.7M params, 10.8K steps）
+**结果**：val_rmse=9.636 dB (+0.253) | **discard**
+**教训**：额外的 cross-branch 层增加了 1.2M 参数并减少了 1.8K 步，净效果为负。3 层已足够。
+
+---
+
+### P2-Exp15: Huber delta=2.0 — (discarded)
+
+**变更**：Huber delta 5.0→2.0
+**结果**：val_rmse=10.061 dB (+0.678) | **discard**
+**教训**：delta=2.0 把太多误差处理为"异常值"（线性惩罚），梯度信号变弱，学习效率下降。
+
+---
+
+### P2-Exp16: 无 Weight Decay — (discarded)
+
+**变更**：weight_decay 1e-4→0
+**结果**：val_rmse=9.685 dB (+0.302) | **discard**
+**教训**：weight_decay=1e-4 的正则化是有帮助的。即使在欠拟合状态，适度正则化也能改善泛化。
+
+---
+
+### P2-Exp17: 无 LR Warmdown — (discarded)
+
+**变更**：warmdown_ratio 0.3→0.0, final_lr_frac 0.01→1.0（恒定 LR）
+**结果**：val_rmse=10.187 dB (+0.804) | **discard**
+**教训**：LR warmdown 对最终收敛至关重要。在训练末期降低 LR 让模型精细调整权重。
+
+---
+
+### P2-Exp18: 2.2M 数据 — **数据扩展突破**
+
+**变更**：训练数据从 1M→2.2M（5000 pyram runs × 500 samples/run）
+**结果**：val_rmse=**8.115 dB (-1.268, -13.5%)** | **keep**
+**分析**：数据翻倍带来 1.27 dB 的巨大改善，而之前 9 个超参/架构实验累计只改善了 0.4 dB。**确认数据量是 Phase 2 的主要瓶颈**。数据/参数比从 ~55:1 提升到 ~112:1。
+
+---
+
+### P2-Exp19: 更宽模型 on 2.2M — (discarded)
+
+**变更**：branch 384→512, fusion 768→1024（34.7M params, 8.2K steps）
+**结果**：val_rmse=8.288 dB (+0.173) | **discard**
+**教训**：即使有 2.2M 数据，更宽模型在 5 分钟内仍然步数不足。时间预算是宽模型的天花板。
+
+---
+
+### P2-Exp20: LR 3.5e-3 + beta2=0.95 — (discarded)
+
+**变更**：LR 3e-3→3.5e-3, Adam beta2 0.999→0.95
+**结果**：val_rmse=8.413 dB (+0.298) | **discard**
+**教训**：在 2.2M 数据上，更高 LR 和更短视的 Adam 二阶矩都没有帮助。
+
+---
+
+### P2-Exp21: Geo 跳跃连接 — (discarded)
+
+**变更**：原始 geo 特征跳跃连接到 fusion trunk 输入
+**结果**：val_rmse=8.191 dB (+0.076) | **discard**
+**教训**：仅边际差距，cross-branch attention 已经充分提取了 geo 信息。额外的跳跃连接是冗余的。
+
+---
+
+### P2-Exp22: FiLM 调制 — (discarded)
+
+**变更**：geo 编码器输出通过 FiLM（Feature-wise Linear Modulation）调制 SSP 和 bathy 分支
+**结果**：val_rmse=9.549 dB (+1.434) | **discard**
+**教训**：严重退步。FiLM 在 cross-branch attention 之前应用，可能干扰了后续注意力层的学习。geo→SSP/bathy 的单向调制不如对称的 cross-attention 有效。
+
+---
+
+### P2-Exp23: 4.4M 数据 — **继续扩展**
+
+**变更**：训练数据从 2.2M→4.4M（10000 pyram runs × 500 samples/run）
+**结果**：val_rmse=**7.677 dB (-0.438, -5.4%)** | **keep**
+**分析**：数据继续扩展有效但边际递减：
+- 1M→2.2M: -1.27 dB（每翻倍 -1.27）
+- 2.2M→4.4M: -0.44 dB（每翻倍 -0.44）
+数据/参数比提升到 ~225:1，但提升幅度已明显缩小。
+
+---
+
+### P2-Exp24: 更宽模型 on 4.4M — (discarded)
+
+**变更**：branch 384→512, fusion 768→1024（34.7M params, 8.6K steps）
+**结果**：val_rmse=7.944 dB (+0.267) | **discard**
+**教训**：4.4M 数据仍无法弥补宽模型的步数劣势。在 5 分钟固定预算下，384/768 (19.5M params) 是最优模型规模。
+
+---
+
+## Phase 2 进展汇总
+
+| # | val_rmse | Δ vs best | 数据量 | Status | 关键变更 |
+|---|----------|-----------|--------|--------|---------|
+| base | 10.314 dB | — | 1M | keep | Phase 1 exp6 架构直接迁移 |
+| 1 | 9.793 dB | -0.521 | 1M | keep | 加宽 384/768 |
+| 2 | 10.220 dB | +0.427 | 1M | discard | LR 5e-3 太激进 |
+| 3 | 10.984 dB | +1.191 | 1M | discard | 深而窄模型 |
+| 4 | 10.139 dB | +0.346 | 1M | discard | batch 2048 |
+| 5 | 10.043 dB | +0.250 | 1M | discard | 5 层 cross-branch |
+| 6 | 10.066 dB | +0.273 | 1M | discard | Huber delta=10 |
+| 7 | 9.910 dB | +0.117 | 1M | discard | MSE loss |
+| **8** | **9.383 dB** | **-0.410** | **1M** | **keep** | **8 注意力头** |
+| 9 | 9.560 dB | +0.177 | 1M | discard | LR 4e-3 |
+| 10 | 10.217 dB | +0.834 | 1M | discard | 600s 训练（过拟合） |
+| 11 | 9.690 dB | +0.307 | 1M | discard | batch 8192（步数不足） |
+| 12 | 10.069 dB | +0.686 | 1M | discard | LR 2e-3（欠拟合） |
+| 13 | 10.115 dB | +0.732 | 1M | discard | 中模型 256/512 |
+| 14 | 9.636 dB | +0.253 | 1M | discard | 4 层 cross-branch |
+| 15 | 10.061 dB | +0.678 | 1M | discard | Huber delta=2.0 |
+| 16 | 9.685 dB | +0.302 | 1M | discard | weight_decay=0 |
+| 17 | 10.187 dB | +0.804 | 1M | discard | 无 LR warmdown |
+| **18** | **8.115 dB** | **-1.268** | **2.2M** | **keep** | **数据翻倍** |
+| 19 | 8.288 dB | +0.173 | 2.2M | discard | 宽模型 512/1024 |
+| 20 | 8.413 dB | +0.298 | 2.2M | discard | LR 3.5e-3 + beta2=0.95 |
+| 21 | 8.191 dB | +0.076 | 2.2M | discard | geo 跳跃连接 |
+| 22 | 9.549 dB | +1.434 | 2.2M | discard | FiLM 调制 |
+| **23** | **7.677 dB** | **-0.438** | **4.4M** | **keep** | **数据再翻倍** |
+| 24 | 7.944 dB | +0.267 | 4.4M | discard | 宽模型 512/1024 |
+
+**Phase 2 当前最佳**：7.677 dB（P2-Exp23）| 4.4M pyram 数据
+
+---
+
+## Phase 2 关键发现
+
+1. **数据量是最大杠杆**：1M→2.2M→4.4M 分别带来 -1.27 和 -0.44 dB 改善，远超任何架构/超参调整
+2. **架构已趋近最优**：在 5 分钟固定预算下，384/768 + 8 heads + 3 cross-branch + 6 fusion 是最佳配置
+3. **时间预算限制模型规模**：更大模型（34.7M params）因步数不足而表现更差
+4. **Huber loss (delta=5.0) 经验证最优**：MSE 和不同 delta 值都更差
+5. **LR 3e-3 是甜蜜点**：更高或更低都会退步
+6. **正则化配置已平衡**：dropout=0.02 + weight_decay=1e-4 是最佳组合
+7. **数据扩展边际递减**：预计需要 10M+ 或架构创新来达到 5 dB 目标
+
+---
+
+## 数据扩展曲线（Phase 2）
+
+| 数据量 | val_rmse | 数据/参数比 | 每翻倍改善 |
+|--------|----------|-----------|-----------|
+| 1M | 9.383 dB | 55:1 | — |
+| 2.2M | 8.115 dB | 112:1 | -1.27 dB |
+| 4.4M | 7.677 dB | 225:1 | -0.44 dB |
+
+外推：若保持 log-linear 趋势，达到 5 dB 可能需要 ~50M 样本或架构创新。
+
+---
+
 ## 物理误差参考
 
 | 误差 | 含义 | ASW 影响 |
