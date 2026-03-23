@@ -64,28 +64,42 @@ def make_branch_encoder(in_dim, hidden_dim, n_layers, dropout):
     return nn.Sequential(*layers)
 
 
-class CrossBranchAttention(nn.Module):
-    """Lightweight cross-attention: each branch attends to all branches."""
+class CrossBranchBlock(nn.Module):
+    """Transformer-style block: cross-attention + FFN, both with pre-norm residual."""
     def __init__(self, dim, n_heads=4, dropout=0.02):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
-        self.norm = nn.LayerNorm(dim)
+        # Attention
+        self.attn_norm = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
-        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = nn.Dropout(dropout)
+        # FFN
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn1 = nn.Linear(dim, dim * 2)
+        self.ffn2 = nn.Linear(dim * 2, dim)
+        self.ffn_dropout = nn.Dropout(dropout)
 
     def forward(self, branches):
         """branches: (B, 3, dim) — 3 branch embeddings stacked as a sequence."""
         B, S, D = branches.shape
-        h = self.norm(branches)
+        # Self-attention with pre-norm residual
+        h = self.attn_norm(branches)
         qkv = self.qkv(h).reshape(B, S, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
         attn = attn.softmax(dim=-1)
-        attn = self.dropout(attn)
+        attn = self.attn_dropout(attn)
         out = (attn @ v).transpose(1, 2).reshape(B, S, D)
-        return branches + self.proj(out)
+        branches = branches + self.proj(out)
+        # FFN with pre-norm residual
+        h = self.ffn_norm(branches)
+        h = F.gelu(self.ffn1(h))
+        h = self.ffn_dropout(h)
+        h = self.ffn2(h)
+        branches = branches + h
+        return branches
 
 
 class TLNet(nn.Module):
@@ -109,10 +123,10 @@ class TLNet(nn.Module):
         self.bathy_encoder = make_branch_encoder(
             config.bathy_dim, config.branch_dim, config.n_branch_layers, config.dropout)
 
-        # Cross-branch attention (2 layers)
+        # Cross-branch transformer blocks (3 layers)
         self.cross_attn = nn.ModuleList([
-            CrossBranchAttention(config.branch_dim, n_heads=4, dropout=config.dropout)
-            for _ in range(2)
+            CrossBranchBlock(config.branch_dim, n_heads=4, dropout=config.dropout)
+            for _ in range(3)
         ])
 
         # Fusion: project concatenated branch outputs to fusion dim
@@ -169,7 +183,7 @@ N_FUSION_LAYERS = 6       # layers in fusion trunk
 DROPOUT = 0.02            # dropout rate
 
 # Optimization
-BATCH_SIZE = 2048         # training batch size
+BATCH_SIZE = 4096         # training batch size (larger for regularization)
 LEARNING_RATE = 3e-3      # peak learning rate
 WEIGHT_DECAY = 1e-4       # AdamW weight decay
 ADAM_BETAS = (0.9, 0.999) # Adam beta parameters
@@ -265,7 +279,8 @@ while True:
     train_loss = loss.detach()
     loss.backward()
 
-    # Optimizer step
+    # Gradient clipping + optimizer step
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
     model.zero_grad(set_to_none=True)
 
