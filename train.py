@@ -183,7 +183,7 @@ N_FUSION_LAYERS = 6       # layers in fusion trunk
 DROPOUT = 0.02            # dropout rate
 
 # Optimization
-BATCH_SIZE = 4096         # training batch size (larger for regularization)
+BATCH_SIZE = 4096         # training batch size
 LEARNING_RATE = 3e-3      # peak learning rate
 WEIGHT_DECAY = 1e-4       # AdamW weight decay
 ADAM_BETAS = (0.9, 0.999) # Adam beta parameters
