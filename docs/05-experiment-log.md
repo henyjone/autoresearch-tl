@@ -761,6 +761,62 @@
 
 ---
 
+### P2-Exp38: AMP bfloat16 — (discarded)
+
+**变更**：启用 bfloat16 混合精度训练
+**结果**：val_rmse=9.053 dB (+1.877) | **discard**
+**教训**：bf16 精度损失导致严重泛化退化。回归任务对数值精度敏感，fp32 必须。
+
+---
+
+### P2-Exp39: 4 层 Branch Encoder — (discarded)
+
+**变更**：n_branch_layers 3→4（35.5M params, 16.5K steps）
+**结果**：val_rmse=7.962 dB (+0.786) | **discard**
+**教训**：更深分支增加参数但减少步数，净效果为负。
+
+---
+
+### P2-Exp40: 4 Cross-Branch + 4 Fusion — (discarded)
+
+**变更**：cross-branch 3→4, fusion 6→4（28.4M params, 16.7K steps）
+**结果**：val_rmse=7.353 dB (+0.177) | **discard**
+**教训**：更多交互层无法弥补 fusion 深度的减少。
+
+---
+
+### P2-Exp41: 自适应 Huber Delta — (discarded)
+
+**变更**：Huber delta 从 10.0 退火到 3.0（初始像 MSE，后期更鲁棒）
+**结果**：val_rmse=7.480 dB (+0.304) | **discard**
+**教训**：初始大 delta 导致 loss 先升后降，浪费训练早期的宝贵步数。
+
+---
+
+### P2-Exp42: Weight Decay 5e-5 — **新最佳**
+
+**变更**：weight_decay 1e-4→5e-5（更轻正则化）
+**结果**：val_rmse=**7.174 dB (-0.002)** | **keep**
+**分析**：9M 数据量下，轻正则化微微有益。改善极小但稳定。
+
+---
+
+### P2-Exp43: MoE 4 Expert (小) — (discarded)
+
+**变更**：Mixture of Experts 架构：4 专家 Top-2, 384/512×4层, 23.7M params
+**结果**：val_rmse=7.301 dB (+0.127) | **discard**
+**教训**：小专家容量不足，路由开销抵消了专业化优势。
+
+---
+
+### P2-Exp44: MoE 4 Expert (大) — (discarded)
+
+**变更**：MoE 架构放大：512/768×4层, 50.5M params, 11.7K steps
+**结果**：val_rmse=7.182 dB (+0.008) | **discard**
+**分析**：接近最佳但太重（50.5M 只跑 11.7K 步）。MoE 在固定时间预算下不划算，除非能大幅加速推理。
+
+---
+
 ## Phase 2 进展汇总
 
 | # | val_rmse | Δ vs best | 数据量 | Status | 关键变更 |
@@ -803,8 +859,15 @@
 | 35 | 7.297 dB | +0.121 | ~9M | discard | 384/768 小模型 |
 | 36 | 7.420 dB | +0.244 | ~9M | discard | batch 2048 |
 | 37 | 7.614 dB | +0.438 | ~9M | discard | LR 4e-3 |
+| 38 | 9.053 dB | +1.877 | ~9M | discard | AMP bfloat16（精度损失） |
+| 39 | 7.962 dB | +0.786 | ~9M | discard | 4 层 branch encoder |
+| 40 | 7.353 dB | +0.177 | ~9M | discard | 4 cross-branch + 4 fusion |
+| 41 | 7.480 dB | +0.304 | ~9M | discard | 自适应 Huber delta |
+| **42** | **7.174 dB** | **-0.002** | **~9M** | **keep** | **weight_decay 5e-5** |
+| 43 | 7.301 dB | +0.127 | ~9M | discard | MoE 4专家（小） |
+| 44 | 7.182 dB | +0.008 | ~9M | discard | MoE 4专家（大） |
 
-**Phase 2 当前最佳**：7.176 dB（P2-Exp33）| ~9M pyram 数据 | 512/1024 + 600s
+**Phase 2 当前最佳**：7.174 dB（P2-Exp42）| ~9M pyram 数据 | 512/1024 + 600s + WD=5e-5
 
 ---
 
@@ -815,9 +878,12 @@
 3. **最优配置**：512/1024 + 8 heads + 3 cross-branch + 6 fusion + 600s + batch 4096
 4. **Huber loss (delta=5.0) 经验证最优**：MSE 和不同 delta 值都更差
 5. **LR 3e-3 是甜蜜点**：4e-3 太高（在 1M/4.4M/9M 数据上都一致），2e-3 欠拟合
-6. **正则化配置已平衡**：dropout=0.02 + weight_decay=1e-4 是最佳组合
+6. **正则化配置已平衡**：dropout=0.02 + weight_decay=5e-5（数据量大时可减轻 WD）
 7. **900s 在任何数据量都过拟合**：4.4M 和 9M 数据都无法支撑 900s 训练
 8. **数据扩展边际递减但仍有效**：预计需要 20M+ 样本继续逼近 5 dB 目标
+9. **MoE 架构有潜力但受时间预算限制**：50.5M MoE 几乎持平最佳，但步数太少
+10. **bf16 不适合此任务**：回归精度对数值精度敏感，必须 fp32
+11. **距离范围扩展**：旧数据最大 100km，缺少深海会聚区（CZ ~55km 周期），已扩展到 300km
 
 ---
 
