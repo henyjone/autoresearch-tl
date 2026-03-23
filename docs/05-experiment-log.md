@@ -265,6 +265,30 @@
 **结果**：val_rmse=1.888 dB (+0.208) | **discard**
 **教训**：3 个线性头共享相同的 fusion trunk 输出，多样性不足，无法形成有效集成。真正的集成需要不同的模型结构或不同的训练初始化。
 
+### Exp19: EMA 权重 — (discarded)
+
+**动机**：用指数移动平均 (EMA) 维护模型权重副本，推理时用 EMA 权重，通常能获得更平滑的泛化
+**变更**：EMA decay=0.999，训练完成后用 EMA 权重评估
+
+**结果**：val_rmse=1.811 dB (+0.131) | **discard**
+**教训**：EMA 权重滞后于最优权重。在 5 分钟训练预算内，模型仍在快速改善，EMA 的平滑效果反而拖慢了收敛。EMA 更适合长时间训练（训练充分后权重波动小时）。
+
+### Exp20: LR 5e-3 + Cosine Warm Restarts — (discarded)
+
+**动机**：SGDR（cosine annealing with warm restarts）周期性重启学习率，帮助跳出局部最优
+**变更**：LR 5e-3，3 次 cosine warm restart 周期
+
+**结果**：val_rmse=1.731 dB (+0.051) | **discard**
+**教训**：Warm restarts 接近但未超过 best。3 个周期意味着每个周期只有 ~100s 训练时间，重启时丢失部分优化进度。在短预算下周期太多反而浪费。
+
+### Exp21: Adam beta2=0.95 + LR 4e-3 — (discarded)
+
+**动机**：降低 Adam beta2（从 0.999 到 0.95），让优化器对近期梯度更敏感，配合略高 LR
+**变更**：ADAM_BETAS=(0.9, 0.95)，LR=4e-3
+
+**结果**：val_rmse=1.707 dB (+0.027) | **discard**
+**教训**：beta2=0.95 让二阶矩估计更"短视"，理论上对非平稳目标更好。但在此任务中数据分布稳定，标准 beta2=0.999 已足够。略有改善但不显著。
+
 ---
 
 ## 进展汇总
@@ -290,6 +314,9 @@
 | 16 | 1.929 dB | +0.249 | discard | 物理残差学习 |
 | 17 | 1.706 dB | +0.026 | discard | Transformer + batch 2048 |
 | 18 | 1.888 dB | +0.208 | discard | 多头预测集成(3头) |
+| 19 | 1.811 dB | +0.131 | discard | EMA 权重(decay=0.999) |
+| 20 | 1.731 dB | +0.051 | discard | LR 5e-3 + cosine warm restarts(3周期) |
+| 21 | 1.707 dB | +0.027 | discard | Adam beta2=0.95 + LR 4e-3 |
 
 **当前最佳**：1.680 dB（实验 6）| 相对 baseline：-0.405 dB（19.4%↓）
 
@@ -309,6 +336,7 @@
 2. **各种正则化**（exp8-11, exp14）：weight_decay、dropout、噪声、mixup、stochastic depth 全部失败
 3. **特征工程**（exp5, exp16）：在归一化后的数据上添加物理特征反而过拟合
 4. **架构变体**（exp12, exp13, exp15, exp18）：Conv1D、多头、模型缩放都无显著改善
+5. **优化器调参**（exp19-21）：EMA、warm restarts、beta2 调整都未突破瓶颈
 
 ### 关键认识
 - **200K 合成数据是当前瓶颈**：模型已经能很好地拟合训练集（~1.0 dB），但泛化到验证集只能到 ~1.68 dB
