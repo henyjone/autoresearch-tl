@@ -23,14 +23,20 @@ from prepare import MAX_FEATURES, TIME_BUDGET, FeatureStats, make_dataloader, ev
 @dataclass
 class TLNetConfig:
     n_features: int = 64       # MAX_FEATURES from prepare.py
-    hidden_dim: int = 512
-    n_layers: int = 6
-    dropout: float = 0.05
+    geo_dim: int = 8           # geometry features [0:8]
+    ssp_dim: int = 20          # SSP features [8:28]
+    bathy_dim: int = 20        # bathymetry features [28:48]
+    reserved_dim: int = 16     # reserved features [48:64]
+    branch_dim: int = 256      # per-branch encoder width
+    fusion_dim: int = 512      # fusion trunk width
+    n_branch_layers: int = 3   # layers per branch encoder
+    n_fusion_layers: int = 6   # layers in fusion trunk
+    dropout: float = 0.02
 
 
 class ResidualBlock(nn.Module):
     """Pre-norm residual block: LayerNorm -> Linear -> GELU -> Dropout -> Linear -> Add"""
-    def __init__(self, dim, dropout=0.05):
+    def __init__(self, dim, dropout=0.02):
         super().__init__()
         self.norm = nn.LayerNorm(dim)
         self.fc1 = nn.Linear(dim, dim * 2)
@@ -45,41 +51,76 @@ class ResidualBlock(nn.Module):
         return x + h
 
 
+def make_branch_encoder(in_dim, hidden_dim, n_layers, dropout):
+    """Build a small MLP encoder for a feature branch."""
+    layers = [nn.Linear(in_dim, hidden_dim), nn.GELU()]
+    for _ in range(n_layers - 1):
+        layers.extend([
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        ])
+    return nn.Sequential(*layers)
+
+
 class TLNet(nn.Module):
-    """Residual MLP for transmission loss prediction.
+    """Branch-encoder + fusion trunk for TL prediction.
 
-    Input:  normalized feature vector (B, MAX_FEATURES)
-    Output: predicted TL in dB (B,)
+    Splits the 64-dim input into 3 semantic groups:
+    - Geometry (8 dims): freq, depths, range, bottom params
+    - SSP (20 dims): sound speed profile at 20 standard depths
+    - Bathymetry (20 dims): water depth along propagation path
 
-    Architecture: Linear projection -> N x ResidualBlock -> LayerNorm -> Linear(1)
+    Each branch is encoded separately, then concatenated and
+    processed through a residual fusion trunk.
     """
 
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.input_proj = nn.Linear(config.n_features, config.hidden_dim)
-        self.blocks = nn.ModuleList([
-            ResidualBlock(config.hidden_dim, config.dropout)
-            for _ in range(config.n_layers)
+
+        # Branch encoders
+        self.geo_encoder = make_branch_encoder(
+            config.geo_dim, config.branch_dim, config.n_branch_layers, config.dropout)
+        self.ssp_encoder = make_branch_encoder(
+            config.ssp_dim, config.branch_dim, config.n_branch_layers, config.dropout)
+        self.bathy_encoder = make_branch_encoder(
+            config.bathy_dim, config.branch_dim, config.n_branch_layers, config.dropout)
+
+        # Fusion: project concatenated branch outputs to fusion dim
+        total_branch = config.branch_dim * 3
+        self.fusion_proj = nn.Linear(total_branch, config.fusion_dim)
+
+        # Fusion trunk (residual blocks)
+        self.fusion_blocks = nn.ModuleList([
+            ResidualBlock(config.fusion_dim, config.dropout)
+            for _ in range(config.n_fusion_layers)
         ])
-        self.out_norm = nn.LayerNorm(config.hidden_dim)
-        self.out_head = nn.Linear(config.hidden_dim, 1)
+        self.out_norm = nn.LayerNorm(config.fusion_dim)
+        self.out_head = nn.Linear(config.fusion_dim, 1)
 
     def forward(self, x, targets=None):
-        """
-        Args:
-            x: (B, MAX_FEATURES) normalized input features
-            targets: (B,) TL values in dB, or None
+        # Split input into branches
+        geo = x[:, :8]      # freq, src_depth, rcv_depth, range, water_depths, bottom params
+        ssp = x[:, 8:28]    # SSP at 20 depths
+        bathy = x[:, 28:48] # bathymetry profile
 
-        Returns:
-            If targets is not None: scalar Huber loss
-            If targets is None: predictions (B,)
-        """
-        h = F.gelu(self.input_proj(x))
-        for block in self.blocks:
+        # Encode each branch
+        geo_h = self.geo_encoder(geo)
+        ssp_h = self.ssp_encoder(ssp)
+        bathy_h = self.bathy_encoder(bathy)
+
+        # Fuse
+        h = torch.cat([geo_h, ssp_h, bathy_h], dim=-1)
+        h = F.gelu(self.fusion_proj(h))
+
+        # Fusion trunk
+        for block in self.fusion_blocks:
             h = block(h)
         h = self.out_norm(h)
-        pred = self.out_head(h).squeeze(-1)  # (B,)
+        pred = self.out_head(h).squeeze(-1)
+
         if targets is not None:
             return F.huber_loss(pred, targets, delta=5.0)
         return pred
@@ -89,14 +130,16 @@ class TLNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-HIDDEN_DIM = 1024         # hidden layer width
-N_LAYERS = 8              # number of residual blocks
+BRANCH_DIM = 256          # per-branch encoder width
+FUSION_DIM = 512          # fusion trunk width
+N_BRANCH_LAYERS = 3       # layers per branch encoder
+N_FUSION_LAYERS = 6       # layers in fusion trunk
 DROPOUT = 0.02            # dropout rate
 
 # Optimization
-BATCH_SIZE = 4096         # training batch size
-LEARNING_RATE = 5e-3      # peak learning rate
-WEIGHT_DECAY = 1e-5       # AdamW weight decay
+BATCH_SIZE = 2048         # training batch size
+LEARNING_RATE = 3e-3      # peak learning rate
+WEIGHT_DECAY = 1e-4       # AdamW weight decay
 ADAM_BETAS = (0.9, 0.999) # Adam beta parameters
 WARMUP_RATIO = 0.05       # fraction of time for LR warmup
 WARMDOWN_RATIO = 0.3      # fraction of time for LR cooldown
@@ -118,8 +161,10 @@ print(f"Feature stats loaded (target mean={stats.target_mean:.1f} dB, std={stats
 # Build model
 config = TLNetConfig(
     n_features=MAX_FEATURES,
-    hidden_dim=HIDDEN_DIM,
-    n_layers=N_LAYERS,
+    branch_dim=BRANCH_DIM,
+    fusion_dim=FUSION_DIM,
+    n_branch_layers=N_BRANCH_LAYERS,
+    n_fusion_layers=N_FUSION_LAYERS,
     dropout=DROPOUT,
 )
 print(f"Model config: {asdict(config)}")
@@ -266,5 +311,7 @@ print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
 print(f"total_samples_M:  {total_samples / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_K:     {num_params / 1000:.1f}")
-print(f"hidden_dim:       {HIDDEN_DIM}")
-print(f"n_layers:         {N_LAYERS}")
+print(f"branch_dim:       {BRANCH_DIM}")
+print(f"fusion_dim:       {FUSION_DIM}")
+print(f"n_branch_layers:  {N_BRANCH_LAYERS}")
+print(f"n_fusion_layers:  {N_FUSION_LAYERS}")
