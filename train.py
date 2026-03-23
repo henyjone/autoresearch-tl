@@ -89,14 +89,14 @@ class TLNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-HIDDEN_DIM = 512          # hidden layer width
-N_LAYERS = 6              # number of residual blocks
-DROPOUT = 0.05            # dropout rate
+HIDDEN_DIM = 1024         # hidden layer width
+N_LAYERS = 8              # number of residual blocks
+DROPOUT = 0.02            # dropout rate
 
 # Optimization
-BATCH_SIZE = 2048         # training batch size
-LEARNING_RATE = 3e-3      # peak learning rate
-WEIGHT_DECAY = 1e-4       # AdamW weight decay
+BATCH_SIZE = 4096         # training batch size
+LEARNING_RATE = 5e-3      # peak learning rate
+WEIGHT_DECAY = 1e-5       # AdamW weight decay
 ADAM_BETAS = (0.9, 0.999) # Adam beta parameters
 WARMUP_RATIO = 0.05       # fraction of time for LR warmup
 WARMDOWN_RATIO = 0.3      # fraction of time for LR cooldown
