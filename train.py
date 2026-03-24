@@ -187,8 +187,8 @@ class TLNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-BRANCH_DIM = 512          # per-branch encoder width (wider + 600s budget)
-FUSION_DIM = 1024         # fusion trunk width (wider + 600s budget)
+BRANCH_DIM = 640          # per-branch encoder width (mid-size between 512 and 768)
+FUSION_DIM = 1280         # fusion trunk width (mid-size between 1024 and 1536)
 N_BRANCH_LAYERS = 3       # layers per branch encoder
 N_FUSION_LAYERS = 6       # layers in fusion trunk
 DROPOUT = 0.02            # dropout rate
