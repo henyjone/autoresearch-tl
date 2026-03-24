@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from prepare import MAX_FEATURES, TIME_BUDGET as _TIME_BUDGET, FeatureStats, make_dataloader, evaluate_rmse
 
 # Override time budget for Phase 2 with large data (4.4M samples can support longer training)
-TIME_BUDGET = 600  # 10 minutes
+TIME_BUDGET = 1800  # 30 minutes (16M data supports long training without overfitting)
 
 # ---------------------------------------------------------------------------
 # TL Prediction Model
